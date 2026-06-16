@@ -4,7 +4,7 @@ set -e
 
 echo "=========================================="
 echo " ESM-2 Embedding Extraction Script"
-echo " With FASTA Header Cleaning"
+echo " With FASTA Header Cleaning + Invalid Token Filtering"
 echo "=========================================="
 echo ""
 
@@ -19,6 +19,8 @@ DEFAULT_TRUNCATION_LEN="1022"
 DEFAULT_NOGPU="n"
 DEFAULT_CLEAN_FASTA="cleaned_proteins_for_esm.fasta"
 DEFAULT_MAPPING_CSV="cleaned_fasta_header_mapping.csv"
+DEFAULT_INVALID_REPORT_CSV="invalid_token_proteins_report.csv"
+DEFAULT_MAX_INVALID_PERCENT="1.0"
 
 # Check that extract.py exists
 if [ ! -f "scripts/extract.py" ]; then
@@ -47,6 +49,12 @@ CLEAN_FASTA=${CLEAN_FASTA:-$DEFAULT_CLEAN_FASTA}
 
 read -p "Header mapping CSV path [$DEFAULT_MAPPING_CSV]: " MAPPING_CSV
 MAPPING_CSV=${MAPPING_CSV:-$DEFAULT_MAPPING_CSV}
+
+read -p "Invalid token report CSV path [$DEFAULT_INVALID_REPORT_CSV]: " INVALID_REPORT_CSV
+INVALID_REPORT_CSV=${INVALID_REPORT_CSV:-$DEFAULT_INVALID_REPORT_CSV}
+
+read -p "Maximum invalid-token percentage allowed for skipping [$DEFAULT_MAX_INVALID_PERCENT]: " MAX_INVALID_PERCENT
+MAX_INVALID_PERCENT=${MAX_INVALID_PERCENT:-$DEFAULT_MAX_INVALID_PERCENT}
 
 read -p "Model name [$DEFAULT_MODEL]: " MODEL
 MODEL=${MODEL:-$DEFAULT_MODEL}
@@ -84,7 +92,7 @@ NOGPU=${NOGPU:-$DEFAULT_NOGPU}
 
 echo ""
 echo "=========================================="
-echo " Step 1: Cleaning FASTA Headers"
+echo " Step 1: Cleaning FASTA Headers + Filtering Invalid Tokens"
 echo "=========================================="
 echo ""
 
@@ -92,10 +100,24 @@ python - <<PY
 from pathlib import Path
 import csv
 import re
+import sys
 
 input_fasta = Path("$FASTA")
 clean_fasta = Path("$CLEAN_FASTA")
 mapping_csv = Path("$MAPPING_CSV")
+invalid_report_csv = Path("$INVALID_REPORT_CSV")
+max_invalid_percent = float("$MAX_INVALID_PERCENT")
+truncation_len = int("$TRUNCATION_LEN")
+
+# ESM-2 accepts the standard amino acids and some ambiguous/rare amino-acid tokens.
+# X = unknown amino acid
+# B = Aspartic acid or Asparagine ambiguity
+# Z = Glutamic acid or Glutamine ambiguity
+# U = Selenocysteine
+# O = Pyrrolysine
+#
+# '*' is NOT valid for ESM. It usually means stop codon / termination.
+VALID_ESM_AA = set("ACDEFGHIKLMNPQRSTVWYBXZUO")
 
 def sanitize(text):
     """
@@ -149,39 +171,126 @@ def parse_header(header):
         "status": sanitize(status),
     }
 
-records = []
-current_header = None
-current_seq = []
+def read_fasta(path):
+    records = []
+    current_header = None
+    current_seq = []
 
-with input_fasta.open("r") as f:
-    for line in f:
-        line = line.rstrip("\\n")
-        if not line:
-            continue
+    with path.open("r") as f:
+        for line in f:
+            line = line.rstrip("\\n")
+            if not line:
+                continue
 
-        if line.startswith(">"):
-            if current_header is not None:
-                records.append((current_header, "".join(current_seq)))
-            current_header = line[1:].strip()
-            current_seq = []
-        else:
-            current_seq.append(line.strip())
+            if line.startswith(">"):
+                if current_header is not None:
+                    records.append((current_header, "".join(current_seq)))
+                current_header = line[1:].strip()
+                current_seq = []
+            else:
+                current_seq.append(line.strip())
 
-    if current_header is not None:
-        records.append((current_header, "".join(current_seq)))
+        if current_header is not None:
+            records.append((current_header, "".join(current_seq)))
+
+    return records
+
+def normalize_sequence(seq):
+    """
+    Remove whitespace and uppercase sequence.
+    Do not replace invalid tokens here.
+    We want to detect and optionally skip invalid records.
+    """
+    return re.sub(r"\\s+", "", seq).upper()
+
+def get_invalid_chars(seq):
+    return sorted(set(seq) - VALID_ESM_AA)
+
+records = read_fasta(input_fasta)
 
 if not records:
     raise SystemExit("ERROR: No FASTA records found.")
+
+# First pass: identify invalid records
+invalid_records = []
+
+for idx, (header, seq) in enumerate(records, start=1):
+    seq_clean = normalize_sequence(seq)
+    invalid_chars = get_invalid_chars(seq_clean)
+
+    if invalid_chars:
+        invalid_records.append({
+            "index": idx,
+            "header": header,
+            "sequence": seq_clean,
+            "invalid_chars": "".join(invalid_chars),
+            "sequence_length": len(seq_clean),
+        })
+
+total_records = len(records)
+invalid_count = len(invalid_records)
+invalid_percent = (invalid_count / total_records * 100) if total_records else 0.0
+
+print(f"Total protein sequences: {total_records}")
+print(f"Sequences with invalid ESM tokens: {invalid_count}")
+print(f"Invalid-token percentage: {invalid_percent:.4f}%")
+print(f"Maximum allowed invalid-token percentage for skipping: {max_invalid_percent:.4f}%")
+
+# Always write invalid report, even if zero invalid records
+invalid_report_csv.parent.mkdir(parents=True, exist_ok=True)
+
+with invalid_report_csv.open("w", newline="") as csvfile:
+    fieldnames = [
+        "index",
+        "invalid_chars",
+        "sequence_length",
+        "original_header",
+        "sequence_preview",
+    ]
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for item in invalid_records:
+        writer.writerow({
+            "index": item["index"],
+            "invalid_chars": item["invalid_chars"],
+            "sequence_length": item["sequence_length"],
+            "original_header": item["header"],
+            "sequence_preview": item["sequence"][:120],
+        })
+
+print(f"Invalid token report saved to: {invalid_report_csv}")
+
+# Stop if invalid-token records are too many
+if invalid_percent >= max_invalid_percent and invalid_count > 0:
+    print("")
+    print("ERROR: Invalid-token sequence percentage is too high.")
+    print("The script will not remove them automatically.")
+    print("")
+    print("Reason:")
+    print(f"  Invalid records: {invalid_count}/{total_records} ({invalid_percent:.4f}%)")
+    print(f"  Allowed threshold: < {max_invalid_percent:.4f}%")
+    print("")
+    print("Please inspect the invalid token report before deciding whether to skip, truncate, or replace.")
+    sys.exit(1)
+
+# If invalid records are under threshold, skip them
+invalid_indices = set(item["index"] for item in invalid_records)
 
 clean_fasta.parent.mkdir(parents=True, exist_ok=True)
 mapping_csv.parent.mkdir(parents=True, exist_ok=True)
 
 used_ids = set()
 mapping_rows = []
+written_count = 0
+skipped_count = 0
+long_count = 0
 
 with clean_fasta.open("w") as fasta_out:
     for idx, (header, seq) in enumerate(records, start=1):
         info = parse_header(header)
+        seq_clean = normalize_sequence(seq)
+        invalid_chars = get_invalid_chars(seq_clean)
 
         base_clean_id = (
             f"seq_{idx:06d}_"
@@ -201,13 +310,24 @@ with clean_fasta.open("w") as fasta_out:
             counter += 1
         used_ids.add(clean_id)
 
-        # Write cleaned FASTA
-        fasta_out.write(f">{clean_id}\\n")
+        skipped_due_to_invalid = idx in invalid_indices
 
-        # Wrap sequence at 80 chars
-        seq = re.sub(r"\\s+", "", seq).upper()
-        for i in range(0, len(seq), 80):
-            fasta_out.write(seq[i:i+80] + "\\n")
+        if skipped_due_to_invalid:
+            skipped_count += 1
+            action = "skipped_invalid_esm_token"
+        else:
+            written_count += 1
+            action = "written"
+
+            if len(seq_clean) > truncation_len:
+                long_count += 1
+
+            # Write cleaned FASTA
+            fasta_out.write(f">{clean_id}\\n")
+
+            # Wrap sequence at 80 chars
+            for i in range(0, len(seq_clean), 80):
+                fasta_out.write(seq_clean[i:i+80] + "\\n")
 
         mapping_rows.append({
             "clean_id": clean_id,
@@ -216,8 +336,10 @@ with clean_fasta.open("w") as fasta_out:
             "gene_id": info["gene_id"],
             "gene_symbol": info["gene_symbol"],
             "protein_length_from_header": info["protein_length"],
-            "actual_sequence_length": len(seq),
+            "actual_sequence_length": len(seq_clean),
             "status": info["status"],
+            "invalid_chars": "".join(invalid_chars),
+            "action": action,
             "original_header": info["original_header"],
         })
 
@@ -231,20 +353,29 @@ with mapping_csv.open("w", newline="") as csvfile:
         "protein_length_from_header",
         "actual_sequence_length",
         "status",
+        "invalid_chars",
+        "action",
         "original_header",
     ]
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(mapping_rows)
 
+print("")
 print(f"Cleaned FASTA saved to: {clean_fasta}")
 print(f"Header mapping CSV saved to: {mapping_csv}")
-print(f"Number of sequences processed: {len(records)}")
+print(f"Number of input sequences: {total_records}")
+print(f"Number of sequences written to cleaned FASTA: {written_count}")
+print(f"Number of sequences skipped due to invalid tokens: {skipped_count}")
 
-long_count = sum(1 for row in mapping_rows if row["actual_sequence_length"] > int("$TRUNCATION_LEN"))
+if skipped_count > 0:
+    print("")
+    print("Skipped invalid-token records because they were below the allowed threshold.")
+    print(f"Skipped percentage: {invalid_percent:.4f}%")
+
 if long_count > 0:
     print("")
-    print(f"WARNING: {long_count} sequences are longer than truncation length $TRUNCATION_LEN.")
+    print(f"WARNING: {long_count} cleaned sequences are longer than truncation length {truncation_len}.")
     print("These will be truncated by extract.py unless you change the truncation setting.")
 PY
 
@@ -256,6 +387,7 @@ echo "Model:                  $MODEL"
 echo "Original FASTA:         $FASTA"
 echo "Cleaned FASTA:          $CLEAN_FASTA"
 echo "Mapping CSV:            $MAPPING_CSV"
+echo "Invalid report CSV:     $INVALID_REPORT_CSV"
 echo "Output directory:       $OUTPUT_DIR"
 echo "Representation layer:   $REPR_LAYER"
 echo "Include:                $INCLUDE"
@@ -312,5 +444,8 @@ echo "  $CLEAN_FASTA"
 echo ""
 echo "Header mapping saved to:"
 echo "  $MAPPING_CSV"
+echo ""
+echo "Invalid token report saved to:"
+echo "  $INVALID_REPORT_CSV"
 echo ""
 echo "Each .pt file name should now correspond to a clean FASTA ID."
